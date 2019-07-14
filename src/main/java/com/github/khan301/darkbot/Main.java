@@ -1,0 +1,356 @@
+package com.github.khan301.darkbot;
+
+import com.bulenkov.darcula.DarculaLaf;
+import com.github.khan301.darkbot.backpage.BackpageManager;
+import com.github.khan301.darkbot.config.Config;
+import com.github.khan301.darkbot.config.ConfigEntity;
+import com.github.khan301.darkbot.config.utils.SpecialTypeAdapter;
+import com.github.khan301.darkbot.core.BotInstaller;
+import com.github.khan301.darkbot.core.DarkBotAPI;
+import com.github.khan301.darkbot.core.IDarkBotAPI;
+import com.github.khan301.darkbot.core.itf.CustomModule;
+import com.github.khan301.darkbot.core.itf.Module;
+import com.github.khan301.darkbot.core.manager.GuiManager;
+import com.github.khan301.darkbot.core.manager.HeroManager;
+import com.github.khan301.darkbot.core.manager.MapManager;
+import com.github.khan301.darkbot.core.manager.PingManager;
+import com.github.khan301.darkbot.core.manager.StarManager;
+import com.github.khan301.darkbot.core.manager.StatsManager;
+import com.github.khan301.darkbot.core.utils.Lazy;
+import com.github.khan301.darkbot.gui.MainGui;
+import com.github.khan301.darkbot.modules.CollectorModule;
+import com.github.khan301.darkbot.modules.EventModule;
+import com.github.khan301.darkbot.modules.LootModule;
+import com.github.khan301.darkbot.modules.LootNCollectorModule;
+import com.github.khan301.darkbot.modules.MapModule;
+import com.github.khan301.darkbot.config.utils.ByteArrayToBase64TypeAdapter;
+import com.github.khan301.darkbot.utils.ReflectionUtils;
+import com.github.khan301.darkbot.utils.Time;
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+
+import javax.swing.*;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
+import java.nio.charset.StandardCharsets;
+
+public class Main extends Thread {
+
+    public static final String VERSION = "1.13.11";
+
+    public static final Gson GSON = new GsonBuilder()
+            .setPrettyPrinting()
+            .setLenient()
+            .registerTypeHierarchyAdapter(byte[].class, new ByteArrayToBase64TypeAdapter())
+            .registerTypeAdapterFactory(new SpecialTypeAdapter())
+            .create();
+
+    public static final Object UPDATE_LOCKER = new Object();
+
+    public static IDarkBotAPI API;
+
+    public final MapManager mapManager;
+    public final StarManager starManager;
+    public final HeroManager hero;
+    public final GuiManager guiManager;
+    public final StatsManager statsManager;
+    public final PingManager pingManager;
+    public final BackpageManager backpage;
+
+    public final Lazy.Sync<Boolean> status;
+
+    public Config config;
+    private boolean failedConfig;
+    private int moduleId;
+    public Module module;
+
+    public long lastRefresh;
+
+    private final BotInstaller botInstaller;
+    private final MainGui form;
+
+    public double avgTick;
+
+    private volatile boolean running;
+    public boolean tickingModule;
+
+    public Main() {
+        super("Main");
+        this.config = new Config();
+        loadConfig();
+
+        API = new DarkBotAPI(config);
+        /*if (config.MISCELLANEOUS.FULL_DEBUG)
+            API = (IDarkBotAPI) Proxy.newProxyInstance(Main.class.getClassLoader(), new Class[]{IDarkBotAPI.class}, IDarkBotAPI.getLoggingHandler((DarkBotAPI) API));
+        */
+
+        try {
+            UIManager.setLookAndFeel(new DarculaLaf());
+        } catch (UnsupportedLookAndFeelException e) {
+            e.printStackTrace();
+        }
+
+        new ConfigEntity(config);
+
+        botInstaller = new BotInstaller();
+        status = new Lazy.Sync<>();
+
+        starManager = new StarManager();
+        mapManager = new MapManager(this);
+        hero = new HeroManager(this);
+        guiManager = new GuiManager(this);
+        statsManager = new StatsManager(this);
+        pingManager = new PingManager();
+
+        botInstaller.add(guiManager);
+        botInstaller.add(mapManager);
+        botInstaller.add(hero);
+        botInstaller.add(statsManager);
+        botInstaller.add(pingManager);
+
+        botInstaller.init();
+
+        botInstaller.invalid.add(value -> {
+            if (!value) lastRefresh = System.currentTimeMillis();
+        });
+
+        status.add(this::onRunningToggle);
+
+        backpage = new BackpageManager(this);
+        form = new MainGui(this);
+
+        if (failedConfig) popupMessage("Error",
+                "Failed to load config. Default config will be used, config won't be save.", JOptionPane.ERROR_MESSAGE);
+
+        checkModule();
+        start();
+        API.createWindow();
+    }
+
+    @Override
+    public void run() {
+        long time;
+
+        while (true) {
+            time = System.currentTimeMillis();
+
+            try {
+                tick();
+            } catch (Exception e) {
+                e.printStackTrace();
+                Time.sleep(1000);
+            }
+
+            double tickTime = System.currentTimeMillis() - time;
+            avgTick = ((avgTick * 9) + tickTime) / 10;
+
+            sleepMax(time, botInstaller.invalid.value ? 1000 :
+                    Math.max(config.MISCELLANEOUS.MIN_TICK, Math.min((int) (avgTick * 1.25), 100)));
+        }
+    }
+
+    private void tick() {
+        status.tick();
+
+        if (isInvalid())
+            invalidTick();
+        else
+            validTick();
+
+        form.tick();
+
+        checkConfig();
+        checkModule();
+    }
+
+    private boolean isInvalid() {
+        return botInstaller.isInvalid();
+    }
+
+    private void invalidTick() {
+        tickingModule = false;
+        botInstaller.verify();
+    }
+
+    private void validTick() {
+        guiManager.tick();
+        hero.tick();
+        mapManager.tick();
+        statsManager.tick();
+
+        tickingModule = running && guiManager.canTickModule();
+        if (tickingModule) tickRunning();
+
+        pingManager.tick();
+        //if (config.MISCELLANEOUS.DEV_STUFF && mapManager.width > 0)
+        //    API.pixelsAndDisplay(0, 0, (int) mapManager.width, (int) mapManager.height);
+    }
+
+    private void tickRunning() {
+        guiManager.pet.tick();
+        checkRefresh();
+        module.tick();
+        checkPetBug();
+    }
+
+    private void checkConfig() {
+        if (config.changed) {
+            config.changed = false;
+            saveConfig();
+        }
+    }
+
+    private void checkPetBug() {
+        if (mapManager.isTarget(hero.pet)) hero.pet.clickable.setRadius(0);
+    }
+
+    private void checkRefresh() {
+        if (config.MISCELLANEOUS.REFRESH_TIME == 0 ||
+                System.currentTimeMillis() - lastRefresh < config.MISCELLANEOUS.REFRESH_TIME * 60 * 1000) return;
+
+        if (!module.canRefresh()) return;
+        System.out.println("Triggering refresh: time arrived & module allows refresh");
+        API.handleRefresh();
+        lastRefresh = System.currentTimeMillis();
+    }
+
+    public <A extends Module> A setModule(A module) {
+        module.install(this);
+        if (module instanceof CustomModule) installCustomModule((CustomModule<?>) module);
+        this.module = module;
+        return module;
+    }
+
+    private <C> void installCustomModule(CustomModule<C> module) {
+        Class<C> configClass = module.configuration();
+        C moduleConfig = null;
+        if (configClass != null) {
+            Object storedConfig = config.CUSTOM_CONFIGS.get(module.id());
+
+            moduleConfig = storedConfig != null ? Main.GSON.fromJson(Main.GSON.toJsonTree(storedConfig), configClass) :
+                            ReflectionUtils.createInstance(configClass);
+            config.CUSTOM_CONFIGS.put(module.id(), moduleConfig);
+
+            form.setCustomConfig(module.name(), moduleConfig);
+        }
+        module.install(this, moduleConfig);
+    }
+
+    public void setRunning(boolean running) {
+        if (this.running == running) return;
+        status.send(running);
+        this.running = running;
+    }
+
+    private void onRunningToggle(boolean running) {
+        lastRefresh = System.currentTimeMillis();
+        if (running && module instanceof MapModule) {
+            moduleId = -1;
+            checkModule();
+        }
+    }
+
+    private void loadConfig() {
+        File config = new File("config.json");
+        if (!config.exists()) {
+            saveConfig();
+            return;
+        }
+        try (InputStreamReader reader = new InputStreamReader(new FileInputStream(config), StandardCharsets.UTF_8)) {
+            this.config = GSON.fromJson(reader, Config.class);
+            if (this.config == null) this.config = new Config();
+        } catch (Exception e) {
+            failedConfig = true;
+            e.printStackTrace();
+        }
+    }
+
+    public void saveConfig() {
+        if (failedConfig) return; // Don't save defaults if config failed to load!
+        File config = new File("config.json");
+        try (OutputStreamWriter writer = new OutputStreamWriter(new FileOutputStream(config), StandardCharsets.UTF_8)) {
+            GSON.toJson(this.config, writer);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public boolean isRunning() {
+        return running;
+    }
+
+    private void checkModule() {
+        if (module == null || moduleId != config.GENERAL.CURRENT_MODULE) {
+            Module module = getModule(moduleId = config.GENERAL.CURRENT_MODULE);
+            setModule(module);
+        }
+    }
+
+    private Module getModule(int id) {
+        if (id != 4) form.setCustomConfig(null, null);
+        switch (id) {
+            case 0: return new CollectorModule();
+            case 1: return new LootModule();
+            case 2: return new LootNCollectorModule();
+            case 3: return new EventModule();
+            case 4: {
+                try {
+                    CustomModule m = getCustomModule();
+                    if (m != null) {
+                        popupMessage("Success", "Successfully loaded custom module",  JOptionPane.INFORMATION_MESSAGE);
+                        return m;
+                    }
+                } catch (Exception e) {
+                    popupMessage("Error compiling module", e.getMessage(), JOptionPane.ERROR_MESSAGE);
+                    e.printStackTrace();
+                }
+                form.setCustomConfig(null, null);
+            }
+            default: return new CollectorModule();
+        }
+    }
+
+    private void popupMessage(String title, String content, int type) {
+        SwingUtilities.invokeLater(() -> {
+            JOptionPane pane = new JOptionPane(content, type);
+            JDialog dialog = pane.createDialog(title);
+            dialog.setIconImage(form.getIconImage());
+            dialog.setAlwaysOnTop(true);
+            dialog.setVisible(true);
+        });
+    }
+
+    private CustomModule getCustomModule() throws Exception {
+        String customModule = config.GENERAL.CUSTOM_MODULE;
+        if (customModule == null || customModule.isEmpty()) {
+            popupMessage("Warning", "No custom module file selected", JOptionPane.WARNING_MESSAGE);
+            return null;
+        }
+        File file = new File(customModule);
+        if (!file.exists()) {
+            popupMessage("Warning", "Custom module file doesn't exist", JOptionPane.WARNING_MESSAGE);
+            return null;
+        }
+        Class<?> newModule = ReflectionUtils.compileModule(file);
+        Module module = (Module) ReflectionUtils.createInstance(newModule);
+        if (module instanceof CustomModule) return (CustomModule) module;
+
+        popupMessage("Warning", "The custom module is outdated, and can't be loaded", JOptionPane.WARNING_MESSAGE);
+        return null;
+    }
+
+    private void sleepMax(long time, int total) {
+        time = System.currentTimeMillis() - time;
+
+        if (time < total) {
+            try {
+                Thread.sleep(total - time);
+            } catch (InterruptedException ignored) {
+            }
+        }
+    }
+}
